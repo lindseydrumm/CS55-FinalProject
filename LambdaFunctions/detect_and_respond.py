@@ -1,6 +1,7 @@
 import json
 import boto3
 import os
+import requests
 from botocore.exceptions import ClientError
 
 # Initialize the boto3 clients
@@ -12,12 +13,12 @@ geo_location_api = "https://freegeoip.app/json/"  #API for geo-location
 # Constants
 THRESHOLD_REQUESTS = 100  # Threshold for suspicious number of requests
 ALERT_SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:123456789012:SecurityAlerts'
+VPC_ID = os.getenv('VPCID')
 
 def lambda_handler(event, context):
     # Extract the log data (assuming the log event is passed in event parameter)
     log_data = event['log_data']  
     ip_address = log_data['ip_address']
-    bucket_name = log_data['bucket_name']
     request_count = log_data['request_count']
     user_agent = log_data['user_agent']
     timestamp = log_data['timestamp']
@@ -25,11 +26,11 @@ def lambda_handler(event, context):
     # Step 1: Geo-location Check
     if not is_known_ip(ip_address):
         if is_ip_suspicious(ip_address):
-            take_action(ip_address, bucket_name, user_agent, timestamp)
+            take_vpc_action(ip_address,  user_agent, timestamp)
 
     # Step 2: Check if the number of requests is suspicious
     if request_count > THRESHOLD_REQUESTS:
-        take_action(ip_address, bucket_name, user_agent, timestamp)
+        take_vpc_action(ip_address, user_agent, timestamp)
 
     # Step 3: No suspicious activity detected
     return {"status": "No action required"}
@@ -56,65 +57,66 @@ def is_ip_suspicious(ip_address):
     
     return False
 
-def take_action(ip_address, bucket_name, user_agent, timestamp):
-    # Step 1: Block IP in S3 bucket policy
-    block_ip(ip_address, bucket_name)
+def take_vpc_action(ip_address, user_agent, timestamp):
+    # Step 1: Block IP in the VPC by updating Network ACLs
+    block_ip_in_vpc(ip_address)
 
     # Step 2: Send an alert to the security team
-    alert_security_team(ip_address, bucket_name, user_agent, timestamp)
+    alert_security_team(ip_address, user_agent, timestamp)
 
     # Step 3: Log the incident
-    log_incident(ip_address, bucket_name, user_agent, timestamp)
+    log_incident(ip_address, user_agent, timestamp)
 
-def block_ip(ip_address, bucket_name):
-    # Modify S3 bucket policy to block the IP
+def block_ip_in_vpc(ip_address):
     try:
-        bucket_policy = s3_client.get_bucket_policy(Bucket=bucket_name)
-        policy = json.loads(bucket_policy['Policy'])
+        # Describe Network ACLs in the VPC
+        response = ec2_client.describe_network_acls(
+            Filters=[{'Name': 'vpc-id', 'Values': [VPC_ID]}]
+        )
 
-        # Add a new policy statement to block the IP
-        policy['Statement'].append({
-            "Effect": "Deny",
-            "Principal": "*",
-            "Action": "s3:*",
-            "Resource": f"arn:aws:s3:::{bucket_name}/*",
-            "Condition": {
-                "IpAddress": {"aws:SourceIp": ip_address}
-            }
-        })
-
-        # Apply the updated policy
-        s3_client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(policy))
-        print(f"Blocked IP {ip_address} on bucket {bucket_name}")
+        for acl in response['NetworkAcls']:
+            acl_id = acl['NetworkAclId']
+            # Create a new deny rule for the suspicious IP
+            response = ec2_client.create_network_acl_entry(
+                NetworkAclId=acl_id,
+                RuleNumber=100,  # Choose an appropriate rule number that doesn't conflict
+                Protocol='-1',  # '-1' means all protocols
+                RuleAction='deny',
+                Egress=False,  # Ingress rule
+                CidrBlock=f'{ip_address}/32',  # Block only this specific IP
+                PortRange={'From': 0, 'To': 65535}  # Block all ports
+            )
+            print(f"Blocked IP {ip_address} in Network ACL {acl_id}")
 
     except ClientError as e:
-        print(f"Error blocking IP {ip_address} on bucket {bucket_name}: {e}")
+        print(f"Error blocking IP {ip_address} in VPC {VPC_ID}: {e}")
 
-def alert_security_team(ip_address, bucket_name, user_agent, timestamp):
-    message = f"Suspicious activity detected in S3 bucket {bucket_name}:\n" \
-              f"IP Address: {ip_address}\nUser-Agent: {user_agent}\nTime: {timestamp}"
+def alert_security_team(ip_address, user_agent, timestamp):
+    message = f"Suspicious activity detected:\n" \
+              f"IP Address: {ip_address}\nUser-Agent: {user_agent}\nTime: {timestamp}\n" \
+              f"Action: IP blocked across VPC {VPC_ID}"
     
     try:
         response = sns_client.publish(
             TopicArn=ALERT_SNS_TOPIC_ARN,
             Message=message,
-            Subject="Security Alert: Suspicious S3 Access"
+            Subject="Security Alert: VPC-Wide Block Applied"
         )
         print(f"Security alert sent: {response['MessageId']}")
 
     except ClientError as e:
         print(f"Failed to send security alert: {e}")
 
-def log_incident(ip_address, bucket_name, user_agent, timestamp):
+def log_incident(ip_address, user_agent, timestamp):
     try:
         cloudwatch_client.put_metric_data(
             Namespace='Security',
             MetricData=[
                 {
-                    'MetricName': 'SuspiciousS3Access',
+                    'MetricName': 'SuspiciousVPCActivity',
                     'Dimensions': [
                         {'Name': 'IP', 'Value': ip_address},
-                        {'Name': 'Bucket', 'Value': bucket_name},
+                        {'Name': 'VPC', 'Value': VPC_ID},
                     ],
                     'Value': 1,
                     'Unit': 'Count',
@@ -122,8 +124,7 @@ def log_incident(ip_address, bucket_name, user_agent, timestamp):
                 },
             ]
         )
-        print(f"Incident logged for IP {ip_address} accessing bucket {bucket_name}")
+        print(f"Incident logged for IP {ip_address} within VPC {VPC_ID}")
 
     except ClientError as e:
         print(f"Failed to log incident: {e}")
-
