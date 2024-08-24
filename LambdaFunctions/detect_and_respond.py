@@ -1,18 +1,18 @@
 import json
 import boto3
 import os
-import requests
 from botocore.exceptions import ClientError
+from urllib import request, error
 
 # Initialize the boto3 clients
-s3_client = boto3.client('s3')
+ec2_client = boto3.client('ec2')
 sns_client = boto3.client('sns')
 cloudwatch_client = boto3.client('cloudwatch')
-geo_location_api = "https://freegeoip.app/json/"  #API for geo-location
+geo_location_api = "https://api.ipbase.com/v2/info?apikey=ipb_live_PXfrD4SmDAPfliJp8JfccDgBysKqySP16Fjz0XbV&ip="  #API for geo-location
 
 # Constants
 THRESHOLD_REQUESTS = 100  # Threshold for suspicious number of requests
-ALERT_SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:123456789012:SecurityAlerts'
+ALERT_SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:727979661750:Security-Alerts.fifo'
 VPC_ID = os.getenv('VPCID')
 
 def lambda_handler(event, context):
@@ -27,16 +27,16 @@ def lambda_handler(event, context):
     if not is_known_ip(ip_address):
         if is_ip_suspicious(ip_address):
             take_vpc_action(ip_address,  user_agent, timestamp)
-
+            
     # Step 2: Check if the number of requests is suspicious
     if request_count > THRESHOLD_REQUESTS:
+        print('Number of Requests is suspicious')
         take_vpc_action(ip_address, user_agent, timestamp)
 
-    # Step 3: No suspicious activity detected
-    return {"status": "No action required"}
+    return {"status": "Log checked successfully"}
 
 def is_known_ip(ip_address):
-    known_ips = os.getenv('KNOWN_IPS')
+    known_ips = os.getenv('KNOWN_IPS') # Ideally this would get known ips from a databse somewhere
     if ip_address in known_ips:
         return True
     else:
@@ -45,19 +45,22 @@ def is_known_ip(ip_address):
 def is_ip_suspicious(ip_address):
     try:
         # Call geo-location API to check the location of the IP
-        response = requests.get(geo_location_api + ip_address)
-        location_data = response.json()
-        
+        url = geo_location_api + ip_address
+        with request.urlopen(url) as response:
+            location_data = json.loads(response.read().decode())
+
         # Example check: If the IP is from a high-risk country
-        if location_data['country_code'] in ['IR', 'KP']:
+        print(f"location of request:{location_data['data']['location']['country']['alpha2']}")
+        if location_data['data']['location']['country']['alpha2'] in ['IR', 'KP', 'RU']:
             return True
-        
-    except Exception as e:
+
+    except error.URLError as e:
         print(f"Failed to determine location for IP {ip_address}: {e}")
     
     return False
 
 def take_vpc_action(ip_address, user_agent, timestamp):
+    print(f"Taking action against: {ip_address}")
     # Step 1: Block IP in the VPC by updating Network ACLs
     block_ip_in_vpc(ip_address)
 
@@ -76,10 +79,19 @@ def block_ip_in_vpc(ip_address):
 
         for acl in response['NetworkAcls']:
             acl_id = acl['NetworkAclId']
+            
+            # Gather existing rule numbers
+            existing_rule_numbers = set(entry['RuleNumber'] for entry in acl['Entries'])
+
+            # Find an available rule number (e.g., start from 1 and go up)
+            new_rule_number = next(iter(existing_rule_numbers))
+            while new_rule_number in existing_rule_numbers:
+                new_rule_number += 1
+                
             # Create a new deny rule for the suspicious IP
             response = ec2_client.create_network_acl_entry(
                 NetworkAclId=acl_id,
-                RuleNumber=100,  # Choose an appropriate rule number that doesn't conflict
+                RuleNumber=new_rule_number,  # Choose an appropriate rule number that doesn't conflict
                 Protocol='-1',  # '-1' means all protocols
                 RuleAction='deny',
                 Egress=False,  # Ingress rule
@@ -95,17 +107,20 @@ def alert_security_team(ip_address, user_agent, timestamp):
     message = f"Suspicious activity detected:\n" \
               f"IP Address: {ip_address}\nUser-Agent: {user_agent}\nTime: {timestamp}\n" \
               f"Action: IP blocked across VPC {VPC_ID}"
-    
+
     try:
         response = sns_client.publish(
             TopicArn=ALERT_SNS_TOPIC_ARN,
             Message=message,
-            Subject="Security Alert: VPC-Wide Block Applied"
+            Subject="Security Alert: VPC-Wide Block Applied",
+            MessageGroupId="security-alerts",  # Add a MessageGroupId
+            MessageDeduplicationId=f"{ip_address}-{timestamp}"
         )
         print(f"Security alert sent: {response['MessageId']}")
 
     except ClientError as e:
         print(f"Failed to send security alert: {e}")
+
 
 def log_incident(ip_address, user_agent, timestamp):
     try:
