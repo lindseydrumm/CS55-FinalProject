@@ -2,4 +2,5 @@
 Yan Dvoretskiy and Lindsey Drumm
 
 Automation of Cloud Security with AWS Lambda
-[Project Documentation](https://github.com/lindseydrumm/CS55-FinalProject/wiki)
+
+To learn more read the [Project Documentation](https://github.com/lindseydrumm/CS55-FinalProject/wiki)
